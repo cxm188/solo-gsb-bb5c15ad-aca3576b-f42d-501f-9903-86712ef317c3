@@ -24,6 +24,10 @@
 按序且**互不重叠**、总代价最低的**完整定位链**（即使某段单独最低代价的候选无法接入完整链，也会考虑
 该段其余合格候选）；唯一最优链返回各引文区间、片段、代价与 `sources`，多个不同最优链并列返回 **409**
 （给出两条不同最优链），无完整链返回 **422**。
+- **`POST /api/find-repetition`**：提交与 `/api/assemble` 相同的有序 `segments`，先复用其拼接文本与
+逐字来源，再在同一拼接文本中寻找两个**互不重叠的等长连续区间**：逐字相同或任一字为 `?` 即兼容，
+区间长度至少 **6** 且至少 **4** 个位置两侧已知字相同；按长度最长、同长度已知相同位更多、再按两起点
+升序取首对，返回两个左闭右开区间及各自原文与逐字 `sources`；无合格重复时 `repeat` 为 `null`。
 
 ## 快速开始
 
@@ -788,6 +792,99 @@ curl -X POST http://localhost:8000/api/locate-quotes \
 `quotes` 段数不在 2～4、某段为空或超过 80 字、缺字段，或 segments 不满足 `/api/assemble` 的
 段数/长度限制、续接失败，同样返回 **422**（续接失败时给出 `failed_segment`，从 0 开始）。
 
+### `POST /api/find-repetition`
+
+供校勘人员发现同一拼接稿中**可能的重复抄写**。请求的 `segments` 与 `/api/assemble` 完全相同（沿用
+2～5 段、单段最长 500 字、总长最长 800 字的限制与续接门槛，续接失败同样返回 **422** 并给出
+`failed_segment`）。接口先复用 `/api/assemble` 得到拼接文本与逐字来源，再在**同一份拼接文本**中寻找
+两个**互不重叠的等长连续区间**：
+
+- **逐字兼容**：对应位置的两个字**相同**，或**任一字为 `?`**（未辨认字）即视为兼容；
+- **长度门槛**：区间长度至少 **6**；
+- **已知相同位门槛**：区间内至少 **4** 个位置是两侧皆为**已知字且相同**（`?` 与他字的兼容配对
+  不计入已知相同位，避免全 `?` 区间造成误报）；
+- **互不重叠**：两区间不共享字，允许贴合（前段 `end` ≤ 后段 `start`）。
+
+**择优规则**：先取**长度最长**的区间对；长度相同时取**已知相同位更多**者；再相同则按
+**两起点升序** `(first.start, second.start)` 取首对，结果确定、不返回并列冲突。两个区间按起点升序记为
+`repeat.first`、`repeat.second`，各自给出左闭右开区间 `[start, end)`、原文片段 `fragment` 与该区间
+逐字 `sources`（与 `fragment` 等长，规则同 `/api/assemble`）。接口**只做发现，不改写拼接文本**；
+不存在合格重复时 `repeat` 为 **`null`**。
+
+请求体：
+
+```json
+{
+  "segments": ["学而时习之不亦朱雀", "朱雀玄武白虎腾蛇青龙学而时习之不亦"]
+}
+```
+
+- `segments`：必填，2～5 个非空字符串；单段最长 500 字，各段总长最长 800 字（同 `/api/assemble`）。
+
+调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/find-repetition \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["学而时习之不亦朱雀", "朱雀玄武白虎腾蛇青龙学而时习之不亦"]}'
+```
+
+响应示例（拼接文本 `学而时习之不亦朱雀玄武白虎腾蛇青龙学而时习之不亦` 中，`学而时习之不亦` 出现
+两次：区间 `[0,7)` 与 `[17,24)` 等长 7 字、7 个已知相同位、互不重叠）：
+
+```json
+{
+  "text": "学而时习之不亦朱雀玄武白虎腾蛇青龙学而时习之不亦",
+  "repeat": {
+    "first": {
+      "start": 0,
+      "end": 7,
+      "fragment": "学而时习之不亦",
+      "sources": [
+        [{ "segment": 0, "pos": 0 }],
+        [{ "segment": 0, "pos": 1 }],
+        [{ "segment": 0, "pos": 2 }],
+        [{ "segment": 0, "pos": 3 }],
+        [{ "segment": 0, "pos": 4 }],
+        [{ "segment": 0, "pos": 5 }],
+        [{ "segment": 0, "pos": 6 }]
+      ]
+    },
+    "second": {
+      "start": 17,
+      "end": 24,
+      "fragment": "学而时习之不亦",
+      "sources": [
+        [{ "segment": 1, "pos": 10 }],
+        [{ "segment": 1, "pos": 11 }],
+        [{ "segment": 1, "pos": 12 }],
+        [{ "segment": 1, "pos": 13 }],
+        [{ "segment": 1, "pos": 14 }],
+        [{ "segment": 1, "pos": 15 }],
+        [{ "segment": 1, "pos": 16 }]
+      ]
+    }
+  }
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `text` | 拼接文本（与 `/api/assemble` 一致，不被改写） |
+| `repeat` | 最优重复区间对；无合格重复时为 `null` |
+| `repeat.first` / `repeat.second` | 起点较小 / 较大的区间，二者等长且互不重叠（`first.end ≤ second.start`） |
+| `start` / `end` | 区间在拼接文本中的下标（从 0 开始，**左闭右开** `[start, end)`） |
+| `fragment` | 区间原文片段，即 `text[start:end]` |
+| `sources` | 该区间的逐字来源列表，与 `fragment` 等长，规则与 `/api/assemble` 一致 |
+
+任一侧含 `?` 仍可配对——例如两处抄写为 `甲乙丙丁戊己` 与 `甲?丙丁戊?` 时，逐字兼容、长度 6、
+已知相同位 4（≥4），同样会被发现；但若兼容位全部来自 `?`（已知相同位不足 4），或两区间只能以
+重叠方式取得（如短周期文本 `甲乙丙甲乙丙…` 中互不重叠窗口不足 6 字），则不构成合格重复。
+
+续接失败、段数/长度不合法、缺字段时同样返回 **422**（续接失败时给出 `failed_segment`，从 0 开始）。
+
 ## 计分与并列规则
 
 - 相同字 **+2**；`?` 与任意字配对 **0**；异字 **-2**；
@@ -819,6 +916,10 @@ curl -X POST http://localhost:8000/api/locate-quotes \
   非空区间（代价规则同上），再选区间按序、两两不重叠（前段 `end` ≤ 后段 `start`）且总代价最低的
   完整定位链；某段单独最优候选无法成链时仍考虑该段其余候选。唯一最优链返回各引文区间、片段、代价与
   sources，多个不同最优链并列返回 **409**（两条不同最优链），无完整链返回 **422**。
+- `/api/find-repetition` 复用 `/api/assemble` 的拼接文本与逐字来源（沿用段数/长度限制与续接失败
+  规则），在同一份拼接文本中找两个互不重叠（允许贴合）的等长连续区间：对应字相同或任一字为 `?`
+  即兼容，长度至少 6 且至少 4 个位置两侧已知字相同；取长度最长者，同长度取已知相同位更多者，再按
+  两起点升序取首对，返回两个左闭右开区间及各自原文与逐字 sources；无合格重复时 `repeat` 为 `null`。
 
 ## 本地开发（不使用 Docker）
 
@@ -844,7 +945,8 @@ app/
   orderer.py    # 未排序转写：穷举排列 + 累计对齐得分选序 + 并列/无完整顺序判定
   reviser.py    # 人工校订：沿逐字来源定位校订并落实改字 + 合并/冲突/定位判定
   locator.py    # 引文定位：半全局编辑代价 DP 查拼接文本区间；多引文按序不重叠最优链 + 并列/无完整链判定
-  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes）
+  repetition.py # 重复抄写发现：对角扫描兼容 run + 滑动窗口取最长/已知相同位最多的非重叠等长区间对
+  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes、/api/find-repetition）
 tests/          # 算法与接口测试
 Dockerfile      # 镜像构建（含依赖安装）
 docker-compose.yml
