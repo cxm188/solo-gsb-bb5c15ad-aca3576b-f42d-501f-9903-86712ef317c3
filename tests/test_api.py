@@ -678,3 +678,76 @@ def test_locate_quotes_quote_limits_validated():
         "/api/locate-quotes", json={**base, "quotes": ["字" * 80] * 4}
     )
     assert resp.status_code in (200, 409, 422)
+
+
+def test_find_repetition_endpoint():
+    segs = ["甲乙丙丁戊己", "丁戊己庚辛甲乙", "辛甲乙丙丁戊己"]
+    resp = client.post("/api/find-repetition", json={"segments": segs})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "甲乙丙丁戊己庚辛甲乙丙丁戊己"
+    rep = data["repeat"]
+    assert rep["length"] == 6
+    assert rep["same_known"] == 6
+    assert (rep["first"]["start"], rep["first"]["end"]) == (0, 6)
+    assert (rep["second"]["start"], rep["second"]["end"]) == (8, 14)
+    assert rep["first"]["fragment"] == "甲乙丙丁戊己"
+    assert rep["second"]["fragment"] == "甲乙丙丁戊己"
+    # 两区间逐字 sources 与 /api/assemble 对应区间一致
+    sources = client.post("/api/assemble", json={"segments": segs}).json()["sources"]
+    assert rep["first"]["sources"] == sources[0:6]
+    assert rep["second"]["sources"] == sources[8:14]
+
+
+def test_find_repetition_endpoint_wildcard_compatible():
+    resp = client.post(
+        "/api/find-repetition",
+        json={"segments": ["甲乙?丁戊己", "丁戊己庚辛甲乙", "辛甲乙丙丁戊己"]},
+    )
+    assert resp.status_code == 200
+    rep = resp.json()["repeat"]
+    assert (rep["length"], rep["same_known"]) == (6, 5)
+    assert rep["first"]["fragment"] == "甲乙?丁戊己"
+    assert rep["second"]["fragment"] == "甲乙丙丁戊己"
+
+
+def test_find_repetition_none_returns_null():
+    resp = client.post(
+        "/api/find-repetition",
+        json={"segments": ["学而?习之", "时习之不", "之不亦乐乎"]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "学而时习之不亦乐乎"
+    assert data["repeat"] is None
+
+
+def test_find_repetition_gate_failure_returns_422_with_failed_segment():
+    resp = client.post(
+        "/api/find-repetition",
+        json={"segments": ["孔子曰未知", "未知生焉", "完全无关文本"]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["failed_segment"] == 2
+
+
+def test_find_repetition_reuses_assemble_segment_limits():
+    # 段数不足 / 超上限
+    assert client.post(
+        "/api/find-repetition", json={"segments": ["abc"]}
+    ).status_code == 422
+    assert client.post(
+        "/api/find-repetition",
+        json={"segments": ["aa", "bb", "cc", "dd", "ee", "ff"]},
+    ).status_code == 422
+    # 单段过长 / 总长超限 / 空段 / 缺字段
+    assert client.post(
+        "/api/find-repetition", json={"segments": ["a" * 500, "b" * 501]}
+    ).status_code == 422
+    assert client.post(
+        "/api/find-repetition", json={"segments": ["字" * 400, "字" * 401]}
+    ).status_code == 422
+    assert client.post(
+        "/api/find-repetition", json={"segments": ["abc", ""]}
+    ).status_code == 422
+    assert client.post("/api/find-repetition", json={}).status_code == 422

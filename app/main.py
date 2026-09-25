@@ -21,6 +21,11 @@
   2 的全部非空区间，选出区间按序且互不重叠、总代价最低的完整定位链；唯一
   最优链返回各引文区间、片段、代价与 sources，多个不同最优链并列返回 409
   及两条不同最优链，无完整链返回 422。
+- ``POST /api/find-repetition``：提交与 ``/api/assemble`` 相同的有序
+  segments，复用其拼接文本与逐字来源，寻找两个互不重叠、逐字兼容（对应字
+  相同或任一字为 ?）、长度至少 6 且至少 4 个位置为两侧相同已知字的连续
+  区间对；选长度最长者，同长取已知相同位更多者，再按两起点升序取首对，
+  返回两区间原文与逐字 sources，无合格重复时 repeat 为 null。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -59,6 +64,7 @@ from .orderer import (
     MIN_SEGMENTS as ORDER_MIN_SEGMENTS,
 )
 from .orderer import NoCompleteOrderError, OrderTieError, determine_order
+from .repetition import find_repetition
 from .reviser import EditConflictError, EditLocationError, revise
 
 MAX_TEXT_LEN = 500   # 单段文本最大长度（残页转写通常远小于此）
@@ -407,6 +413,40 @@ class LocateQuotesResponse(BaseModel):
     )
 
 
+class RepeatInterval(BaseModel):
+    """重复区间：左闭右开区间、原文片段与逐字来源。"""
+
+    start: int = Field(..., description="区间起点下标（含，从 0 开始）")
+    end: int = Field(..., description="区间终点下标（不含，左闭右开）")
+    fragment: str = Field(..., description="区间原文片段（拼接文本 [start, end)）")
+    sources: list[list[CharSource]] = Field(
+        ...,
+        description="该区间逐字来源列表，与 fragment 等长，规则与 /api/assemble 一致",
+    )
+
+
+class Repetition(BaseModel):
+    """一对合格重复区间（first 起点先于 second，两区间互不重叠）。"""
+
+    length: int = Field(..., description="区间长度（两区间等长，至少 6）")
+    same_known: int = Field(
+        ...,
+        description="两侧相同的已知字（非 ?）位置数（至少 4）",
+    )
+    first: RepeatInterval = Field(..., description="靠前的重复区间")
+    second: RepeatInterval = Field(..., description="靠后的重复区间")
+
+
+class FindRepetitionResponse(BaseModel):
+    """重复抄写发现结果。"""
+
+    text: str = Field(..., description="拼接文本（与 /api/assemble 的结果一致，不被改写）")
+    repeat: Repetition | None = Field(
+        ...,
+        description="最优合格重复区间对；无合格重复时为 null",
+    )
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
@@ -418,6 +458,7 @@ def index():
         "revise": "POST /api/revise",
         "locate_quote": "POST /api/locate-quote",
         "locate_quotes": "POST /api/locate-quotes",
+        "find_repetition": "POST /api/find-repetition",
         "docs": "/docs",
         "health": "/health",
     }
@@ -843,5 +884,50 @@ def api_locate_quotes(req: LocateQuotesRequest):
                 "message": str(exc),
                 "cost": exc.cost,
                 "ties": exc.chains,
+            },
+        ) from exc
+
+
+@app.post(
+    "/api/find-repetition",
+    response_model=FindRepetitionResponse,
+    status_code=200,
+    summary="发现拼接稿中可能的重复抄写区间对",
+    description=(
+        "请求沿用 `/api/assemble` 的 segments 限制（2～5 段、单段最长 500 字、"
+        "总长最长 800 字）与续接门槛（不满足返回 422 并给出 failed_segment），"
+        "先复用其拼接得到文本与逐字来源，再在拼接文本中寻找两个**互不重叠**"
+        "的等长连续区间：逐位置对应字相同或任一字为 `?` 即兼容，区间长度至少 "
+        "6，且至少 4 个位置是两侧相同的已知字（非 `?`）。选长度最长的区间对；"
+        "同长度时选已知相同位更多者；仍并列时按两起点升序取首对。返回拼接文本 "
+        "text 与 repeat（区间长度、已知相同位数、两个左闭右开区间及各自原文"
+        "片段和逐字 sources）；无合格重复时 repeat 为 null。接口只做发现与"
+        "报告，不改写拼接文本。"
+    ),
+    responses={
+        422: {
+            "description": "续接失败或请求参数不合法",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "第 3 段（段序号 2）无法与前文可靠拼接：需要最高对齐得分 > 0 且至少 2 对相同已知字",
+                            "failed_segment": 2,
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+def api_find_repetition(req: AssembleRequest):
+    try:
+        return find_repetition(req.segments)
+    except AssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "failed_segment": exc.failed_segment,
             },
         ) from exc
